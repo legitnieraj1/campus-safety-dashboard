@@ -51,6 +51,11 @@ LOG_LEVEL       = logging.INFO
 # Cloud relay — set this env var to enable pushing data to the cloud
 CLOUD_RELAY_URL = os.environ.get("CLOUD_RELAY_URL", "")  # e.g. "https://xxx.up.railway.app"
 
+# Bind to this local IP when connecting to the ESP32.
+# Forces traffic through WiFi even when iPhone USB tethering is active.
+# Set to "" to let the OS pick the interface (default behavior).
+WIFI_LOCAL_IP   = os.environ.get("WIFI_LOCAL_IP", "192.168.4.2")
+
 # ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -97,7 +102,15 @@ async def poll_esp32():
     else:
         log.info("Cloud relay disabled (set CLOUD_RELAY_URL env var to enable)")
 
-    async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
+    # Bind to WiFi local IP to force traffic through WiFi interface,
+    # bypassing iPhone USB tethering routing conflict.
+    transport = None
+    if WIFI_LOCAL_IP:
+        import socket, httpx._transports.default as _td
+        transport = httpx.AsyncHTTPTransport(local_address=WIFI_LOCAL_IP)
+        log.info("ESP32 client bound to local IP %s (WiFi interface)", WIFI_LOCAL_IP)
+
+    async with httpx.AsyncClient(timeout=FETCH_TIMEOUT, transport=transport) as client:
         while True:
             try:
                 resp = await client.get(ESP32_URL)

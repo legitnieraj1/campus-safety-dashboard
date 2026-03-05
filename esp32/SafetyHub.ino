@@ -8,288 +8,226 @@
  *    - MQ2       (ADC pin 34, gas level)
  *    - DHT11     (GPIO 4, temp + humidity)
  *
- *  Architecture:
- *    ESP32 runs a WiFi Access Point + HTTP server.
- *    Clients connect to "SafetyHub" SSID and poll:
- *      GET http://192.168.4.1/api/data
+ *  Architecture (v2 - STA mode, direct cloud push):
+ *    ESP32 connects to Mac hotspot WiFi.
+ *    Every 2s, POSTs sensor JSON to cloud relay:
+ *      POST https://safetyhub-relay.onrender.com/ingest
  *
- *  Stability fixes applied:
- *    1. WiFi power-save disabled (WIFI_PS_NONE)
- *    2. AP-mode only — no STA, no association timeouts
- *    3. Sensor reads are non-blocking (timed intervals)
- *    4. WebServer.handleClient() called every loop tick
- *    5. Watchdog timer enabled (60 s)
- *    6. JSON built with char[] — no String heap fragmentation
- *    7. MPU6050 read uses raw registers — no heavy library malloc
- *    8. CORS header added so browser dashboards work directly
+ *  No laptop gateway needed. ESP32 → Cloud → Vercel directly.
  * ============================================================
  */
 
-#include <WiFi.h>
-#include <WebServer.h>
-#include <Wire.h>
 #include <DHT.h>
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <esp_task_wdt.h>
+#include <esp_wifi.h>
 #include <math.h>
-#include <esp_task_wdt.h>   // hardware watchdog
-#include <esp_wifi.h>       // esp_wifi_set_ps() — required in core v3.x
 
 // ── Pin / bus config ────────────────────────────────────────
-#define DHT_PIN        4
-#define DHT_TYPE       DHT11
-#define MQ2_PIN        34     // ADC1 channel (must be ADC1 for WiFi coexistence)
-#define SDA_PIN        21
-#define SCL_PIN        22
-#define MPU6050_ADDR   0x68
+#define DHT_PIN 4
+#define DHT_TYPE DHT11
+#define MQ2_PIN 34
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define MPU6050_ADDR 0x68
 
-// ── WiFi AP credentials ─────────────────────────────────────
-const char* AP_SSID     = "SafetyHub";
-const char* AP_PASSWORD = "safetyhub123";   // min 8 chars for WPA2; use "" for open
+// ── WiFi STA credentials (Mac hotspot) ─────────────────────
+const char *STA_SSID = "campussafety";
+const char *STA_PASSWORD = "campussafety";
+
+// ── Cloud relay endpoint ─────────────────────────────────────
+const char *RELAY_URL = "https://safetyhub-relay.onrender.com/ingest";
 
 // ── Thresholds ───────────────────────────────────────────────
-const float  TEMP_DANGER      = 45.0f;
-const int    GAS_DANGER       = 800;
-const float  VIBRATION_DANGER = 2.5f;
+const float TEMP_DANGER = 45.0f;
+const int GAS_DANGER = 800;
+const float VIBRATION_DANGER = 2.5f;
 
 // ── Timing (ms) ─────────────────────────────────────────────
-const uint32_t SENSOR_INTERVAL = 500;   // read sensors every 500 ms
-const uint32_t WDT_TIMEOUT_SEC = 60;    // watchdog resets ESP32 if loop stalls
+const uint32_t PUSH_INTERVAL = 2000;  // push to cloud every 2s
+const uint32_t SENSOR_INTERVAL = 500; // read sensors every 500ms
+const uint32_t WDT_TIMEOUT_SEC = 60;
 
 // ── Global objects ───────────────────────────────────────────
-DHT       dht(DHT_PIN, DHT_TYPE);
-WebServer server(80);
+DHT dht(DHT_PIN, DHT_TYPE);
 
-// ── Sensor value cache (written by readSensors, read by handleAPI) ──
 struct SensorData {
-  float    temperature;
-  float    humidity;
-  int      gasLevel;
-  float    vibration;       // resultant G-force (0-based baseline subtracted)
-  char     alert[48];       // fixed-size, no heap allocation
-  bool     valid;           // false until first successful read
-} sensorCache = {0, 0, 0, 0.0f, "Initializing", false};
+  float temperature;
+  float humidity;
+  int gasLevel;
+  float vibration;
+  char alert[48];
+  bool valid;
+} sd = {0, 0, 0, 0.0f, "Initializing", false};
 
 uint32_t lastSensorRead = 0;
+uint32_t lastPush = 0;
 
 // ============================================================
-//  MPU6050 helpers — raw I2C, no library overhead
+//  MPU6050 helpers
 // ============================================================
 bool mpuInit() {
   Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x6B);   // PWR_MGMT_1
-  Wire.write(0x00);   // wake up, internal 8 MHz oscillator
-  if (Wire.endTransmission(true) != 0) return false;
-
-  // Set accel full-scale to ±8 g  (0x10 → AFS_SEL=1)
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  if (Wire.endTransmission(true) != 0)
+    return false;
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x1C);
-  Wire.write(0x10);
+  Wire.write(0x00);
   Wire.endTransmission(true);
-
-  // DLPF bandwidth 44 Hz — reduces noise on seismic readings
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x1A);
-  Wire.write(0x03);
-  Wire.endTransmission(true);
-
   return true;
 }
 
-// Returns resultant acceleration magnitude minus 1 g (gravity removed)
 float mpuReadVibration() {
   Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x3B);   // ACCEL_XOUT_H
-  if (Wire.endTransmission(false) != 0) return -1.0f;
-  if (Wire.requestFrom(MPU6050_ADDR, 6, true) < 6) return -1.0f;
-
+  Wire.write(0x3B);
+  if (Wire.endTransmission(false) != 0)
+    return 0.0f;
+  Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)6, true);
+  if (Wire.available() < 6)
+    return 0.0f;
   int16_t ax = (Wire.read() << 8) | Wire.read();
   int16_t ay = (Wire.read() << 8) | Wire.read();
   int16_t az = (Wire.read() << 8) | Wire.read();
-
-  // ±8 g scale factor: 32768 / 8 = 4096 LSB/g
-  float gx = ax / 4096.0f;
-  float gy = ay / 4096.0f;
-  float gz = az / 4096.0f;
-
-  // Resultant magnitude
-  float mag = sqrtf(gx*gx + gy*gy + gz*gz);
-
-  // Subtract 1 g (gravity baseline); clamp to 0
-  float vib = mag - 1.0f;
-  if (vib < 0.0f) vib = 0.0f;
-
-  return vib;
+  float gx = ax / 16384.0f;
+  float gy = ay / 16384.0f;
+  float gz = az / 16384.0f;
+  float magnitude = sqrtf(gx * gx + gy * gy + gz * gz);
+  float vibration = fabsf(magnitude - 1.0f);
+  return vibration;
 }
 
 // ============================================================
-//  Sensor read (called on interval, non-blocking)
+//  Sensor reading
 // ============================================================
 void readSensors() {
-  // ── DHT11 ────────────────────────────────────────────────
   float t = dht.readTemperature();
   float h = dht.readHumidity();
-  if (!isnan(t)) sensorCache.temperature = t;
-  if (!isnan(h)) sensorCache.humidity    = h;
+  if (!isnan(t))
+    sd.temperature = t;
+  if (!isnan(h))
+    sd.humidity = h;
 
-  // ── MQ2 (raw ADC → integer 0-4095) ───────────────────────
-  // Take 4-sample average to reduce ADC noise
-  int adcSum = 0;
-  for (int i = 0; i < 4; i++) {
-    adcSum += analogRead(MQ2_PIN);
-    delayMicroseconds(200);
-  }
-  sensorCache.gasLevel = adcSum / 4;
+  int raw = analogRead(MQ2_PIN);
+  sd.gasLevel = map(raw, 0, 4095, 0, 1023);
+  sd.vibration = mpuReadVibration();
+  sd.valid = true;
 
-  // ── MPU6050 ───────────────────────────────────────────────
-  float vib = mpuReadVibration();
-  if (vib >= 0.0f) sensorCache.vibration = vib;
-
-  // ── Alert logic ──────────────────────────────────────────
-  if (sensorCache.vibration >= VIBRATION_DANGER) {
-    snprintf(sensorCache.alert, sizeof(sensorCache.alert),
-             "Earthquake Detected! %.2fG", sensorCache.vibration);
-  } else if (sensorCache.gasLevel >= GAS_DANGER) {
-    snprintf(sensorCache.alert, sizeof(sensorCache.alert),
-             "Gas Leak Detected! Level: %d", sensorCache.gasLevel);
-  } else if (sensorCache.temperature >= TEMP_DANGER) {
-    snprintf(sensorCache.alert, sizeof(sensorCache.alert),
-             "High Temperature! %.1fC", sensorCache.temperature);
+  // Determine alert
+  if (sd.temperature >= TEMP_DANGER) {
+    snprintf(sd.alert, sizeof(sd.alert), "FIRE ALERT — High Temperature");
+  } else if (sd.gasLevel >= GAS_DANGER) {
+    snprintf(sd.alert, sizeof(sd.alert), "GAS ALERT — Dangerous Gas Level");
+  } else if (sd.vibration >= VIBRATION_DANGER) {
+    snprintf(sd.alert, sizeof(sd.alert), "SEISMIC ALERT — Vibration Detected");
   } else {
-    strncpy(sensorCache.alert, "System Normal", sizeof(sensorCache.alert));
+    snprintf(sd.alert, sizeof(sd.alert), "System Normal");
   }
-
-  sensorCache.valid = true;
 }
 
 // ============================================================
-//  HTTP handlers
+//  Push to cloud relay
 // ============================================================
-
-// /api/data  — returns JSON sensor snapshot
-void handleApiData() {
-  // CORS — allows browser dashboards on any origin
-  server.sendHeader("Access-Control-Allow-Origin",  "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  server.sendHeader("Cache-Control",                "no-cache");
-
-  if (!sensorCache.valid) {
-    server.send(503, "application/json",
-                "{\"error\":\"Sensors initializing, retry in 1s\"}");
+void pushToCloud() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Not connected — skipping push");
     return;
   }
 
-  // Build JSON into a fixed char buffer — avoids String heap churn
-  char buf[256];
-  snprintf(buf, sizeof(buf),
-    "{"
-      "\"temperature\":%.1f,"
-      "\"humidity\":%.1f,"
-      "\"gasLevel\":%d,"
-      "\"vibration\":%.3f,"
-      "\"alert\":\"%s\""
-    "}",
-    sensorCache.temperature,
-    sensorCache.humidity,
-    sensorCache.gasLevel,
-    sensorCache.vibration,
-    sensorCache.alert
-  );
+  char body[256];
+  snprintf(body, sizeof(body),
+           "{\"temperature\":%.1f,\"humidity\":%.1f,\"gasLevel\":%d,"
+           "\"vibration\":%.3f,\"alert\":\"%s\"}",
+           sd.temperature, sd.humidity, sd.gasLevel, sd.vibration, sd.alert);
 
-  server.send(200, "application/json", buf);
-}
+  HTTPClient http;
+  http.begin(RELAY_URL);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(4000);
 
-// OPTIONS pre-flight (CORS)
-void handleOptions() {
-  server.sendHeader("Access-Control-Allow-Origin",  "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-  server.send(204);
-}
-
-// 404 fallback
-void handleNotFound() {
-  server.send(404, "application/json", "{\"error\":\"Not found\"}");
+  int code = http.POST(body);
+  if (code > 0) {
+    Serial.printf("[Cloud] POST %d — %s\n", code, sd.alert);
+  } else {
+    Serial.printf("[Cloud] POST failed: %s\n",
+                  http.errorToString(code).c_str());
+  }
+  http.end();
 }
 
 // ============================================================
-//  setup()
+//  Setup
 // ============================================================
 void setup() {
   Serial.begin(115200);
-  delay(200);
   Serial.println("\n[SafetyHub] Booting...");
 
-  // ── Watchdog (ESP32 Arduino core v3.x API) ───────────────
-  // v3.x changed esp_task_wdt_init() to accept a config struct
-  esp_task_wdt_config_t wdt_config = {
-    .timeout_ms     = WDT_TIMEOUT_SEC * 1000,
-    .idle_core_mask = 0,    // don't watch idle tasks
-    .trigger_panic  = true  // hard-reset on timeout
-  };
-  esp_task_wdt_reconfigure(&wdt_config);  // reconfigure if already init'd by IDF
-  esp_task_wdt_add(NULL);   // watch the main Arduino task
+  // Watchdog
+  esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
+  esp_task_wdt_add(NULL);
 
-  // ── I2C ──────────────────────────────────────────────────
+  // I2C for MPU6050
   Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(400000);    // 400 kHz fast mode
-
   if (mpuInit()) {
     Serial.println("[SafetyHub] MPU6050 OK");
   } else {
-    Serial.println("[SafetyHub] MPU6050 FAIL — check wiring");
+    Serial.println("[SafetyHub] MPU6050 not found — vibration will read 0");
   }
 
-  // ── DHT11 ────────────────────────────────────────────────
+  // DHT11
   dht.begin();
-  Serial.println("[SafetyHub] DHT11 OK");
+  Serial.println("[SafetyHub] DHT11 started");
 
-  // ── MQ2 ──────────────────────────────────────────────────
-  // analogSetAttenuation() removed in core v3.x — set per-pin only
-  analogSetPinAttenuation(MQ2_PIN, ADC_11db);   // 0–3.3 V range
-  Serial.println("[SafetyHub] MQ2 OK");
-
-  // ── WiFi Access Point ────────────────────────────────────
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASSWORD[0] ? AP_PASSWORD : nullptr);
-
-  // CRITICAL: disable power-save — this is the #1 cause of AP disconnects
-  // esp_wifi_set_ps() is in <esp_wifi.h> (added to includes above)
+  // Connect to Mac hotspot
+  Serial.printf("[WiFi] Connecting to '%s'...\n", STA_SSID);
+  WiFi.mode(WIFI_STA);
   esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.begin(STA_SSID, STA_PASSWORD);
 
-  IPAddress ip = WiFi.softAPIP();
-  Serial.printf("[SafetyHub] AP started  SSID: %s  IP: %s\n",
-                AP_SSID, ip.toString().c_str());
+  uint32_t wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - wifiStart > 15000) {
+      Serial.println("[WiFi] TIMEOUT — restarting...");
+      ESP.restart();
+    }
+    delay(500);
+    Serial.print(".");
+    esp_task_wdt_reset();
+  }
 
-  // ── HTTP routes ──────────────────────────────────────────
-  server.on("/api/data", HTTP_GET,     handleApiData);
-  server.on("/api/data", HTTP_OPTIONS, handleOptions);
-  server.onNotFound(handleNotFound);
-  server.begin();
-  Serial.println("[SafetyHub] HTTP server running on port 80");
-
-  // ── Initial sensor read ──────────────────────────────────
-  readSensors();
-  lastSensorRead = millis();
-
+  Serial.printf("\n[WiFi] Connected! IP: %s\n",
+                WiFi.localIP().toString().c_str());
+  Serial.printf("[SafetyHub] Pushing to: %s\n", RELAY_URL);
   Serial.println("[SafetyHub] Ready.");
 }
 
 // ============================================================
-//  loop()  — must be tight and non-blocking
+//  Loop
 // ============================================================
 void loop() {
-  // Feed watchdog every iteration
   esp_task_wdt_reset();
 
-  // Handle pending HTTP requests immediately
-  server.handleClient();
-
-  // Read sensors on interval (non-blocking)
   uint32_t now = millis();
+
+  // Read sensors every 500ms
   if (now - lastSensorRead >= SENSOR_INTERVAL) {
     lastSensorRead = now;
     readSensors();
   }
 
-  // Yield to RTOS / WiFi stack — prevents task starvation
-  yield();
+  // Push to cloud every 2s
+  if (sd.valid && now - lastPush >= PUSH_INTERVAL) {
+    lastPush = now;
+    pushToCloud();
+  }
+
+  // Reconnect if WiFi dropped
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Lost connection — reconnecting...");
+    WiFi.reconnect();
+    delay(1000);
+  }
 }
