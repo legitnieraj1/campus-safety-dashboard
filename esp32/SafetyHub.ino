@@ -21,7 +21,7 @@
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include <esp_task_wdt.h>
+// esp_task_wdt.h removed — causes TWDT errors on ESP32 core v3.x
 #include <esp_wifi.h>
 #include <math.h>
 
@@ -48,7 +48,7 @@ const float VIBRATION_DANGER = 2.5f;
 // ── Timing (ms) ─────────────────────────────────────────────
 const uint32_t PUSH_INTERVAL = 2000;  // push to cloud every 2s
 const uint32_t SENSOR_INTERVAL = 500; // read sensors every 500ms
-const uint32_t WDT_TIMEOUT_SEC = 60;
+// WDT_TIMEOUT_SEC removed — watchdog disabled
 
 // ── Global objects ───────────────────────────────────────────
 DHT dht(DHT_PIN, DHT_TYPE);
@@ -192,14 +192,18 @@ void setup() {
   WiFi.begin(STA_SSID, STA_PASSWORD);
 
   uint32_t wifiStart = millis();
+  int attempts = 0;
   while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - wifiStart > 15000) {
-      Serial.println("[WiFi] TIMEOUT — restarting...");
-      ESP.restart();
-    }
     delay(500);
     Serial.print(".");
-    esp_task_wdt_reset();
+    attempts++;
+    if (attempts % 20 == 0) {
+      Serial.printf("\n[WiFi] Still trying... status=%d\n", WiFi.status());
+    }
+    if (millis() - wifiStart > 30000) {
+      Serial.println("\n[WiFi] TIMEOUT after 30s — restarting...");
+      ESP.restart();
+    }
   }
 
   Serial.printf("\n[WiFi] Connected! IP: %s\n",
