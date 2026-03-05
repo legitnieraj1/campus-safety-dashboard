@@ -15,6 +15,7 @@
 #include <DHT.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <esp_wifi.h>
 #include <math.h>
@@ -116,8 +117,10 @@ void pushToCloud() {
            "\"vibration\":%.3f,\"alert\":\"%s\"}",
            sd.temperature, sd.humidity, sd.gasLevel, sd.vibration, sd.alert);
 
+  WiFiClientSecure client;
+  client.setInsecure(); // skip cert verification
   HTTPClient http;
-  http.begin(RELAY_URL);
+  http.begin(client, RELAY_URL);
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(5000);
   int code = http.POST(body);
