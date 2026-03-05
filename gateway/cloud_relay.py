@@ -9,18 +9,21 @@ Endpoints:
     GET  /sensor-data    →  latest sensor snapshot (JSON)
     GET  /health         →  relay + data-source status
     GET  /history        →  last N readings (default 50)
+    WS   /ws             →  real-time WebSocket stream to dashboard
 
 Run locally:
     uvicorn cloud_relay:app --host 0.0.0.0 --port 8000
 """
 
+import asyncio
+import json
 import logging
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -50,6 +53,36 @@ class RelayState:
 
 state = RelayState()
 
+# ── WebSocket connection manager ─────────────────────────────
+class ConnectionManager:
+    def __init__(self):
+        self.active: list[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+        log.info("WebSocket client connected (%d total)", len(self.active))
+
+    def disconnect(self, ws: WebSocket):
+        self.active.remove(ws)
+        log.info("WebSocket client disconnected (%d remaining)", len(self.active))
+
+    async def broadcast(self, data: dict):
+        """Send data to all connected WebSocket clients."""
+        if not self.active:
+            return
+        message = json.dumps(data)
+        stale = []
+        for ws in self.active:
+            try:
+                await ws.send_text(message)
+            except Exception:
+                stale.append(ws)
+        for ws in stale:
+            self.active.remove(ws)
+
+manager = ConnectionManager()
+
 # ── Pydantic model for incoming data ────────────────────────
 class SensorPayload(BaseModel):
     temperature: float
@@ -63,8 +96,8 @@ class SensorPayload(BaseModel):
 # ── FastAPI app ──────────────────────────────────────────────
 app = FastAPI(
     title="SafetyHub Cloud Relay",
-    description="Receives sensor data from laptop gateway, serves to public dashboard",
-    version="1.0.0",
+    description="Receives sensor data from laptop gateway, serves to public dashboard via HTTP + WebSocket",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -80,6 +113,7 @@ app.add_middleware(
 async def ingest(payload: SensorPayload):
     """
     Laptop gateway POSTs sensor JSON here every 2 seconds.
+    Immediately broadcasts to all WebSocket clients.
     """
     ts = datetime.now(timezone.utc).isoformat()
     data = payload.model_dump()
@@ -104,16 +138,46 @@ async def ingest(payload: SensorPayload):
         data["gasLevel"],    data["vibration"], data["alert"],
     )
 
-    return {"status": "ok", "total_ingested": state.total_ingested}
+    # ── Broadcast to all WebSocket clients instantly ─────────
+    await manager.broadcast(data)
+
+    return {
+        "status": "ok",
+        "total_ingested": state.total_ingested,
+        "ws_clients": len(manager.active),
+    }
 
 
-@app.get("/sensor-data", summary="Latest sensor snapshot")
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    """
+    Dashboard connects here for real-time sensor updates.
+    On connect: sends the latest reading immediately (if available).
+    Then: receives broadcasts whenever /ingest is called.
+    """
+    await manager.connect(ws)
+
+    # Send latest data immediately so dashboard doesn't show blank
+    if state.latest:
+        try:
+            await ws.send_text(json.dumps(state.latest))
+        except Exception:
+            pass
+
+    try:
+        # Keep connection alive — listen for client pings/messages
+        while True:
+            await ws.receive_text()  # blocks until client sends or disconnects
+    except WebSocketDisconnect:
+        manager.disconnect(ws)
+
+
+@app.get("/sensor-data", summary="Latest sensor snapshot (HTTP fallback)")
 async def get_sensor_data():
     """
     Returns the most recent sensor reading.
-    If no data received recently, returns 503.
+    Used as fallback when WebSocket is unavailable.
     """
-    # Check if data is stale
     if state.latest is None:
         return JSONResponse(
             status_code=503,
@@ -144,6 +208,7 @@ async def health():
         "age_seconds":       round(age, 1) if age else None,
         "total_ingested":    state.total_ingested,
         "history_count":     len(state.history),
+        "ws_clients":        len(manager.active),
     }
 
 
